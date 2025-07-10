@@ -6,7 +6,7 @@ logger = logging.getLogger(__name__)
 
 @loader.tds
 class MistralAuto(loader.Module):
-    """ Автоответчик в ЛС через Mistral AI с памятью и фильтрацией"""
+    """Автоответчик в ЛС через Mistral AI с памятью, блокировкой и ручными запросами"""
     strings = {"name": "MistralAuto"}
 
     def __init__(self):
@@ -76,8 +76,7 @@ class MistralAuto(loader.Module):
                 self.dialogues[uid].append({"role": "assistant", "content": reply})
             await message.reply(reply)
         except Exception as e:
-            logger.error("Mistral API error: %s", e)
-            await message.reply("⚠️ Ошибка при обращении к Mistral API.")
+            await message.reply(f"⚠️ Ошибка Mistral: {e}")
 
     async def ask_mistral(self, messages, api_key):
         url = "https://api.mistral.ai/v1/chat/completions"
@@ -94,6 +93,8 @@ class MistralAuto(loader.Module):
         async with aiohttp.ClientSession() as session:
             async with session.post(url, json=data, headers=headers) as resp:
                 result = await resp.json()
+                if "choices" not in result:
+                    raise Exception(result.get("error", "неизвестная ошибка"))
                 return result["choices"][0]["message"]["content"].strip()
 
     @loader.command()
@@ -116,8 +117,7 @@ class MistralAuto(loader.Module):
             reply = await self.ask_mistral(messages, key)
             await utils.answer(message, reply)
         except Exception as e:
-            logger.error("Mistral cmd error: %s", e)
-            await utils.answer(message, "⚠️ Ошибка при запросе к Mistral.")
+            await utils.answer(message, f"⚠️ Ошибка Mistral: {e}")
 
     @loader.command()
     async def mistraltoggle(self, message):

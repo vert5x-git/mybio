@@ -6,11 +6,11 @@ logger = logging.getLogger(__name__)
 
 @loader.tds
 class MistralAuto(loader.Module):
-    """ Автоответчик в ЛС через Mistral AI с поддержкой памяти"""
+    """ Автоответчик в ЛС через Mistral AI с памятью и фильтрацией"""
     strings = {"name": "MistralAuto"}
 
     def __init__(self):
-        self.dialogues = {}  # user_id: [messages]
+        self.dialogues = {}
         self.config = loader.ModuleConfig(
             loader.ConfigValue(
                 "mistral_key", "",
@@ -18,7 +18,7 @@ class MistralAuto(loader.Module):
             ),
             loader.ConfigValue(
                 "enabled", True,
-                lambda: "🟢 Включить автоответ в ЛС"
+                lambda: "🟢 Включить автоответ глобально"
             ),
             loader.ConfigValue(
                 "system_prompt", "Ты дружелюбный и умный помощник. Отвечай кратко и по делу.",
@@ -30,7 +30,11 @@ class MistralAuto(loader.Module):
             ),
             loader.ConfigValue(
                 "max_history", 10,
-                lambda: "📦 Максимум сообщений в истории (для каждого юзера)"
+                lambda: "📦 Максимум сообщений в истории"
+            ),
+            loader.ConfigValue(
+                "blocked_users", [],
+                lambda: "🚫 Список отключённых пользователей"
             ),
         )
 
@@ -38,6 +42,8 @@ class MistralAuto(loader.Module):
         if not self.config["enabled"]:
             return
         if not message.is_private or message.out or not message.text:
+            return
+        if message.sender_id in self.config["blocked_users"]:
             return
 
         await self.handle_ai(message)
@@ -50,26 +56,20 @@ class MistralAuto(loader.Module):
 
         uid = str(message.sender_id)
         user_text = message.text
-
-        # Формируем историю диалога
         messages = []
+
         if self.config["use_memory"]:
             if uid not in self.dialogues:
                 self.dialogues[uid] = []
             self.dialogues[uid].append({"role": "user", "content": user_text})
             messages = [{"role": "system", "content": self.config["system_prompt"]}] + self.dialogues[uid]
+            self.dialogues[uid] = self.dialogues[uid][-self.config["max_history"] * 2:]
         else:
             messages = [
                 {"role": "system", "content": self.config["system_prompt"]},
                 {"role": "user", "content": user_text}
             ]
 
-        # Обрезка истории
-        max_len = self.config["max_history"]
-        if self.config["use_memory"]:
-            self.dialogues[uid] = self.dialogues[uid][-max_len * 2:]  # user/assistant чередуются
-
-        # Запрос к Mistral API
         try:
             reply = await self.ask_mistral(messages, api_key)
             if self.config["use_memory"]:
@@ -85,7 +85,6 @@ class MistralAuto(loader.Module):
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json"
         }
-
         data = {
             "model": "mistral-medium",
             "messages": messages,
@@ -99,16 +98,14 @@ class MistralAuto(loader.Module):
 
     @loader.command()
     async def mistral(self, message):
-        """<текст> — ручной запрос к Mistral"""
+        """<вопрос> — ручной запрос к Mistral"""
         text = utils.get_args_raw(message)
         if not text:
-            await utils.answer(message, "📌 Использование: `.mistral твой вопрос`")
-            return
+            return await utils.answer(message, "📌 `.mistral твой вопрос`")
 
-        api_key = self.config["mistral_key"]
-        if not api_key:
-            await utils.answer(message, "❌ Укажи API ключ через `.config MistralAuto`")
-            return
+        key = self.config["mistral_key"]
+        if not key:
+            return await utils.answer(message, "❌ Укажи API ключ через `.config MistralAuto`")
 
         messages = [
             {"role": "system", "content": self.config["system_prompt"]},
@@ -116,8 +113,50 @@ class MistralAuto(loader.Module):
         ]
 
         try:
-            reply = await self.ask_mistral(messages, api_key)
+            reply = await self.ask_mistral(messages, key)
             await utils.answer(message, reply)
         except Exception as e:
-            logger.error("Mistral command error: %s", e)
+            logger.error("Mistral cmd error: %s", e)
             await utils.answer(message, "⚠️ Ошибка при запросе к Mistral.")
+
+    @loader.command()
+    async def mistraltoggle(self, message):
+        """Включить/отключить автоответ глобально"""
+        current = self.config["enabled"]
+        self.config["enabled"] = not current
+        await utils.answer(message, f"✅ Автоответ: {'включён' if not current else 'отключён'}")
+
+    @loader.command()
+    async def mistralblock(self, message):
+        """<@ или id> — отключить автоответ для пользователя"""
+        user = await self._get_user_id(message)
+        if user is None:
+            return await utils.answer(message, "❌ Не удалось определить пользователя.")
+        if user in self.config["blocked_users"]:
+            return await utils.answer(message, "⚠️ Уже в списке.")
+        self.config["blocked_users"].append(user)
+        await utils.answer(message, f"🚫 Пользователь `{user}` заблокирован для автоответов.")
+
+    @loader.command()
+    async def mistralunblock(self, message):
+        """<@ или id> — включить автоответ для пользователя"""
+        user = await self._get_user_id(message)
+        if user is None:
+            return await utils.answer(message, "❌ Не удалось определить пользователя.")
+        if user not in self.config["blocked_users"]:
+            return await utils.answer(message, "⚠️ Пользователь не в списке.")
+        self.config["blocked_users"].remove(user)
+        await utils.answer(message, f"✅ Пользователь `{user}` разблокирован.")
+
+    async def _get_user_id(self, message):
+        args = utils.get_args_raw(message)
+        if not args and message.reply_to:
+            reply = await message.get_reply_message()
+            return reply.sender_id
+        if args.isdigit():
+            return int(args)
+        try:
+            entity = await message.client.get_entity(args)
+            return entity.id
+        except Exception:
+            return None
